@@ -1,0 +1,36 @@
+{
+  "manifest_version": 3,
+  "name": "Pixiv Bookmark Random",
+  "version": "1.3.0",
+  "description": "Bottom-right Random button on Pixiv and pximg image pages. Prefetches upcoming random bookmarked images for near-instant switching.",
+  "permissions": [
+    "storage",
+    "declarativeNetRequest",
+    "declarativeNetRequestWithHostAccess"
+  ],
+  "host_permissions": [
+    "https://www.pixiv.net/*",
+    "https://i.pximg.net/*"
+  ],
+  "background": {
+    "service_worker": "src/background/index.js",
+    "type": "module"
+  },
+  "content_scripts": [
+    {
+      "matches": [
+        "https://www.pixiv.net/*",
+        "https://i.pximg.net/*"
+      ],
+      "js": [
+        "src/content/content.js"
+      ],
+      "run_at": "document_start"
+    }
+  ],
+  "icons": {
+    "16": "icons/icon16.png",
+    "48": "icons/icon48.png",
+    "128": "icons/icon128.png"
+  }
+}
