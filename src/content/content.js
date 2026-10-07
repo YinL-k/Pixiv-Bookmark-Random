@@ -22,6 +22,8 @@
     lastHref: '',
     // Last explicit tag context observed from a bookmarks list URL (can be "").
     lastExplicitTag: undefined, // string | undefined
+    // Logged-in Pixiv account ID extracted from Pixiv's page bootstrap data.
+    userIdHint: '',
 
     queue: Array(BUFFER_SIZE).fill(null),
     ready: Array(BUFFER_SIZE).fill(false),
@@ -51,6 +53,130 @@
     } catch {
       return null;
     }
+  }
+
+  function normalizeUserId(value) {
+    const s = String(value ?? '').trim();
+    return /^\d+$/.test(s) ? s : '';
+  }
+
+  function readUserIdCandidate(value) {
+    if (!value || typeof value !== 'object') return '';
+    return normalizeUserId(value.userId ?? value.user_id ?? value.id);
+  }
+
+  function parseJsonMaybe(raw) {
+    if (typeof raw !== 'string' || !raw.trim()) return null;
+    try {
+      return JSON.parse(raw);
+    } catch {
+      return null;
+    }
+  }
+
+  function findUserIdInPixivBootstrap(data) {
+    if (!data || typeof data !== 'object') return '';
+
+    const directCandidates = [
+      data?.userData?.self,
+      data?.userData,
+      data?.currentUser,
+      data?.loginUser,
+      data?.loggedInUser,
+      data?.props?.pageProps?.userData?.self,
+      data?.props?.pageProps?.userData,
+      data?.props?.pageProps?.currentUser,
+      data?.props?.pageProps?.api?.userData?.self,
+      data?.props?.pageProps?.api?.userData,
+      data?.api?.userData?.self,
+      data?.api?.userData,
+    ];
+
+    for (const candidate of directCandidates) {
+      const id = readUserIdCandidate(candidate);
+      if (id) return id;
+    }
+
+    // Current Pixiv pages may store the actual state as a JSON string inside
+    // __NEXT_DATA__. Parse that nested state before doing a bounded search.
+    const serialized = data?.props?.pageProps?.serverSerializedPreloadedState;
+    if (typeof serialized === 'string') {
+      const nested = parseJsonMaybe(serialized);
+      const id = findUserIdInPixivBootstrap(nested);
+      if (id) return id;
+    } else if (serialized && typeof serialized === 'object') {
+      const id = findUserIdInPixivBootstrap(serialized);
+      if (id) return id;
+    }
+
+    const identityKeys = new Set(['userData', 'currentUser', 'loginUser', 'loggedInUser']);
+    const queue = [{ value: data, depth: 0 }];
+    const seen = new WeakSet();
+    let inspected = 0;
+
+    while (queue.length && inspected < 1500) {
+      const { value, depth } = queue.shift();
+      if (!value || typeof value !== 'object') continue;
+      if (seen.has(value)) continue;
+      seen.add(value);
+      inspected += 1;
+
+      for (const [key, child] of Object.entries(value)) {
+        if (!child || typeof child !== 'object') continue;
+
+        if (identityKeys.has(key)) {
+          const selfId = readUserIdCandidate(child.self);
+          if (selfId) return selfId;
+          const id = readUserIdCandidate(child);
+          if (id) return id;
+        }
+
+        if (depth < 8) queue.push({ value: child, depth: depth + 1 });
+      }
+    }
+
+    return '';
+  }
+
+  function extractLoggedInUserIdFromDom() {
+    if (location.hostname !== 'www.pixiv.net') return '';
+
+    const jsonSources = [];
+    const metaSelectors = [
+      'meta[name="global-data"]',
+      'meta#meta-global-data',
+      'meta[name="preload-data"]',
+    ];
+    for (const selector of metaSelectors) {
+      const el = document.querySelector(selector);
+      const raw = el?.getAttribute?.('content');
+      if (raw) jsonSources.push(raw);
+    }
+
+    const scriptSelectors = [
+      'script#__NEXT_DATA__',
+      'script#meta-global-data',
+      'script[type="application/json"][data-name="global-data"]',
+    ];
+    for (const selector of scriptSelectors) {
+      const el = document.querySelector(selector);
+      const raw = el?.textContent;
+      if (raw) jsonSources.push(raw);
+    }
+
+    for (const raw of jsonSources) {
+      const parsed = parseJsonMaybe(raw);
+      const id = findUserIdInPixivBootstrap(parsed);
+      if (id) return id;
+    }
+
+    return '';
+  }
+
+  function getUserIdHint() {
+    const detected = extractLoggedInUserIdFromDom();
+    if (detected) STATE.userIdHint = detected;
+    return STATE.userIdHint || '';
   }
 
   function parseTagFromUrl(urlStr) {
@@ -244,6 +370,7 @@
       tagNameMode: tagReq.tagNameMode,
       size: BUFFER_SIZE,
       excludeIllustIds,
+      userIdHint: getUserIdHint(),
     });
 
     if (!resp || !resp.ok || !Array.isArray(resp.queue)) {
@@ -345,6 +472,7 @@
         tagNameMode: tagReq.tagNameMode,
         size: BUFFER_SIZE,
         excludeIllustIds,
+        userIdHint: getUserIdHint(),
       });
 
       if (resp?.ok && resp?.candidate?.url) {
@@ -358,6 +486,7 @@
         tagName: tagReq.tagName,
         tagNameMode: tagReq.tagNameMode,
         excludeIllustIds,
+        userIdHint: getUserIdHint(),
       });
       if (resp2?.ok && resp2?.candidate?.url) {
         location.href = resp2.candidate.url;
@@ -414,15 +543,89 @@
     }, 500);
   }
 
+
+
+  // Click only the black letterbox area around a direct pximg image.
+  // Do not place an overlay above the page: at document_start the <img> may not
+  // exist yet, which can make a transparent full-screen layer intercept image clicks.
+  function ensureBlackBorderNextLayer() {
+    if (location.hostname !== 'i.pximg.net') return;
+
+    const marker = 'pixivRandomBlackBorderClickInstalled';
+    if (document.documentElement.dataset[marker] === '1') return;
+    document.documentElement.dataset[marker] = '1';
+
+    document.addEventListener('click', (e) => {
+      // The Random button has its own click handler.
+      if (e.target?.closest?.(`#${BTN_ID}`)) return;
+
+      const img = document.querySelector('img');
+      if (!img) return;
+
+      const rect = img.getBoundingClientRect();
+      const x = e.clientX;
+      const y = e.clientY;
+
+      const clickedInsideImage =
+        x >= rect.left &&
+        x <= rect.right &&
+        y >= rect.top &&
+        y <= rect.bottom;
+
+      // Preserve the browser's normal image click/zoom behavior.
+      if (clickedInsideImage) return;
+
+      // Outside the image is the black letterbox area.
+      onClick();
+    });
+  }
+
+  // Press the plain Space key to advance to the next random bookmarked image.
+  // Do not hijack Space while the user is typing or interacting with form controls.
+  function ensureSpaceNextShortcut() {
+    document.addEventListener('keydown', (e) => {
+      if (e.code !== 'Space' || e.repeat || e.defaultPrevented) return;
+      if (e.ctrlKey || e.metaKey || e.altKey || e.shiftKey) return;
+
+      const target = e.target;
+      if (target instanceof Element) {
+        if (
+          target.isContentEditable ||
+          target.closest('input, textarea, select, button, [contenteditable], [role="textbox"]')
+        ) {
+          return;
+        }
+      }
+
+      // Prevent the browser/Pixiv default Space action (usually page scrolling).
+      e.preventDefault();
+      e.stopPropagation();
+      onClick();
+    }, { capture: true });
+  }
+
   function boot() {
     ensureButton();
+    ensureBlackBorderNextLayer();
+    ensureSpaceNextShortcut();
     startPersistenceLoop();
 
-    const initialReq = getTagReqForUrl(location.href);
-    ensurePrefetchBuffer(initialReq);
+    const initialEnsure = () => {
+      getUserIdHint();
+      ensurePrefetchBuffer(getTagReqForUrl(location.href));
+    };
+
+    // At document_start Pixiv's bootstrap JSON may not exist yet. Waiting for
+    // DOMContentLoaded prevents a failed legacy redirect request on first load.
+    if (document.readyState === 'loading') {
+      document.addEventListener('DOMContentLoaded', initialEnsure, { once: true });
+    } else {
+      initialEnsure();
+    }
 
     document.addEventListener('visibilitychange', () => {
       if (!document.hidden) {
+        getUserIdHint();
         ensurePrefetchBuffer(getTagReqForUrl(location.href));
       }
     });

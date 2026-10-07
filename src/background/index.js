@@ -11,6 +11,7 @@ import {
   warmStartupPools,
 } from './buffer.js';
 import { markRecentWorkId } from './recent.js';
+import { rememberUserIdHint } from './pixiv_api.js';
 
 // --- Lifecycle: install/startup ---
 
@@ -98,6 +99,10 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     if (typeof tabId !== 'number') {
       throw new Error('无法获取 tabId。');
     }
+
+    // Pixiv's legacy /bookmark.php redirect is unreliable in Chrome. Cache the
+    // logged-in user ID extracted by the content script before any API work.
+    await rememberUserIdHint(msg.userIdHint);
 
     switch (msg.type) {
       case 'ENSURE_BUFFER':

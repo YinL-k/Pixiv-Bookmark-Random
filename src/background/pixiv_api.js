@@ -17,10 +17,48 @@ function normalizeTag(tag) {
   return typeof tag === 'string' ? tag : '';
 }
 
+function normalizeUserId(value) {
+  const s = String(value ?? '').trim();
+  return /^\d+$/.test(s) ? s : '';
+}
+
+export async function rememberUserIdHint(value) {
+  const userId = normalizeUserId(value);
+  if (!userId) return false;
+
+  const entry = { userId, cachedAt: now() };
+  memoUserId = entry;
+  await setLocal(USER_ID_CACHE_KEY, entry);
+  return true;
+}
+
 export async function fetchPixivJson(url) {
-  const res = await fetch(url, { credentials: 'include' });
+  let res;
+  try {
+    res = await fetch(url, {
+      credentials: 'include',
+      redirect: 'follow',
+      headers: { Accept: 'application/json, text/plain, */*' },
+    });
+  } catch (e) {
+    const detail = (e instanceof Error && e.message) ? ` (${e.message})` : '';
+    throw new Error(`无法访问 Pixiv API${detail}`);
+  }
+
+  const text = await res.text();
   if (!res.ok) throw new Error(`Pixiv API 请求失败: ${res.status}`);
-  const data = await res.json();
+
+  let data;
+  try {
+    data = JSON.parse(text);
+  } catch {
+    const finalUrl = res.url || '';
+    if (finalUrl.includes('accounts.pixiv.net') || finalUrl.includes('return_to=')) {
+      throw new Error('Pixiv 登录状态不可用。请先登录 Pixiv，然后刷新页面。');
+    }
+    throw new Error('Pixiv API 返回了非 JSON 内容。请刷新 Pixiv 页面后重试。');
+  }
+
   if (data && data.error) throw new Error(data.message || 'Pixiv API 返回错误。');
   return data;
 }
@@ -36,31 +74,20 @@ export function buildBookmarksApiUrl(userId, tagName, offset, limit) {
 }
 
 async function resolveUserIdFromSelfEndpoint() {
-  // Pixiv often exposes the current user via /ajax/user/self
   const data = await fetchPixivJson('https://www.pixiv.net/ajax/user/self?lang=en');
   const b = data?.body;
-  const id = b?.userId ?? b?.id ?? b?.user_id;
-  if (id !== undefined && id !== null && String(id).trim()) return String(id);
-  throw new Error('无法从 self API 解析用户 ID。');
-}
-
-async function resolveUserIdFromRedirect() {
-  let res;
-  try {
-    res = await fetch('https://www.pixiv.net/bookmark.php', { credentials: 'include' });
-  } catch {
-    throw new Error('无法访问 Pixiv。请确认网络可用且已登录。');
-  }
-
-  const finalUrl = res.url || '';
-  if (finalUrl.includes('accounts.pixiv.net')) {
-    throw new Error('未登录 Pixiv。请先登录 Pixiv。');
-  }
-  const m = finalUrl.match(/pixiv\.net\/(?:[a-z]{2}\/)?users\/(\d+)\/bookmarks/);
-  if (!m || !m[1]) {
-    throw new Error('无法解析用户 ID。建议先打开一次 Pixiv 收藏页。');
-  }
-  return m[1];
+  const id = normalizeUserId(
+    b?.userId ??
+    b?.user_id ??
+    b?.id ??
+    b?.self?.userId ??
+    b?.self?.user_id ??
+    b?.self?.id ??
+    b?.userData?.userId ??
+    b?.userData?.id
+  );
+  if (id) return id;
+  throw new Error('无法从 Pixiv self API 解析用户 ID。');
 }
 
 export async function resolveUserId() {
@@ -69,24 +96,24 @@ export async function resolveUserId() {
 
   const stored = await getLocal(USER_ID_CACHE_KEY, null);
   if (stored && typeof stored === 'object') {
-    const userId = stored.userId;
+    const userId = normalizeUserId(stored.userId);
     const cachedAt = stored.cachedAt;
-    if (typeof userId === 'string' && typeof cachedAt === 'number' && (t - cachedAt) < USER_ID_TTL_MS) {
+    if (userId && typeof cachedAt === 'number' && (t - cachedAt) < USER_ID_TTL_MS) {
       memoUserId = { userId, cachedAt };
       return userId;
     }
   }
 
-  let userId = null;
   try {
-    userId = await resolveUserIdFromSelfEndpoint();
+    const userId = await resolveUserIdFromSelfEndpoint();
+    await rememberUserIdHint(userId);
+    return userId;
   } catch {
-    userId = await resolveUserIdFromRedirect();
+    // Do not use the obsolete /bookmark.php redirect fallback. In Chrome it can
+    // redirect to an HTML page and trigger a CORS failure. The content script
+    // supplies the logged-in account ID from Pixiv's bootstrap JSON instead.
+    throw new Error('无法识别当前 Pixiv 账号。请确认已登录，并刷新任意 Pixiv 页面后重试。');
   }
-
-  memoUserId = { userId: String(userId), cachedAt: t };
-  await setLocal(USER_ID_CACHE_KEY, memoUserId);
-  return memoUserId.userId;
 }
 
 export async function fetchTotalBookmarks(userId, tagName) {
